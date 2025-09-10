@@ -1,0 +1,151 @@
+# scripts/analyze_drift.py
+import json
+from collections import OrderedDict
+
+def get_name_from_id(rid: str) -> str:
+    """Extract the last part of the resourceId (actual resource name)."""
+    if not rid:
+        return ""
+    return rid.split("/")[-1]
+
+def record_check(results, rid, pciReq, desc, passed, evidence=""):
+    results.append(OrderedDict([
+        ("pciReq", pciReq),
+        ("resourceName", get_name_from_id(rid)),
+        ("desc", desc),
+        ("status", "PASS" if passed else "FAIL"),
+        ("evidence", evidence)
+    ]))
+
+def analyze_storage(data, results):
+    acc = data.get("account", {})
+    rid = acc.get("id")
+    if not rid: return
+
+    # PCI DSS Req 1 & 7: Restrict network access
+    val = acc.get("publicNetworkAccess")
+    passed = val == "Disabled"
+    record_check(results, rid, "1,7", "Storage: Public network access disabled", passed, f"publicNetworkAccess={val}")
+
+    # PCI DSS Req 3: Encryption at rest enabled
+    val = acc.get("encryption", {}).get("services")
+    if val:
+        blob_status = val.get("blob", {}).get("enabled")
+        file_status = val.get("file", {}).get("enabled")
+        evidence = f"blob={blob_status}, file={file_status}"
+    else:
+        evidence = "services=None"
+    record_check(results, rid, "3", "Storage: Encryption at rest enabled", bool(val), evidence)
+
+    # PCI DSS Req 7: Blob anonymous access
+    val = acc.get("allowBlobPublicAccess", True)
+    passed = not val
+    evidence = f"allowBlobPublicAccess={val}"
+    record_check(results, rid, "7", "Storage: Blob anonymous access disabled", passed, evidence)
+
+    # PCI DSS Req 10: Logging enabled
+    diag = acc.get("diagnostics_profile", {}).get("boot_diagnostics", {}).get("enabled")
+    passed = diag is True
+    record_check(results, rid, "10", "Storage: Boot diagnostics enabled", passed, f"boot_diagnostics={diag}")
+
+def analyze_vms(data, results):
+    vms = data.get("vms", [])
+    # flatten if nested
+    if len(vms) == 1 and isinstance(vms[0], list):
+        vms = vms[0]
+
+    for vm in vms:
+        rid = vm.get("id")
+
+        patch_status = vm.get("patchStatus", {}).get("availablePatchSummary", {})
+        patch_state = patch_status.get("status", "NotReported")
+        critical_count = patch_status.get("criticalAndSecurityPatchCount", "N/A")
+
+        passed = (patch_state == "Succeeded" and critical_count == 0)
+        evidence = f"patchAssessmentState={patch_state}, criticalAndSecurityPatchCount={critical_count}"
+        record_check(results, rid, "6", "VM: Latest OS patches applied", passed, evidence)
+
+        val = vm.get("networkProfile")
+        passed = bool(val)
+        record_check(results, rid, "1,7", "VM: NSG restrictions applied", passed,
+                     f"networkProfile_present={bool(val)}")
+
+        val = vm.get("storageProfile", {}).get("osDisk", {}).get("encryptionSettings")
+        passed = bool(val)
+        record_check(results, rid, "3", "VM: OS disk encryption enabled", passed,
+                     f"encryptionSettings_present={bool(val)}")
+
+        val = vm.get("diagnosticsProfile")
+        passed = bool(val)
+        record_check(results, rid, "10", "VM: Diagnostics logging enabled", passed,
+                     f"diagnosticsProfile_present={bool(val)}")
+
+def analyze_iam(data, results):
+    for user in data.get("users", []):
+        uid = user.get("id")
+
+        # PCI DSS Req 7: No guest users in privileged roles
+        val = user.get("userType")
+        passed = val != "Guest"
+        record_check(results, uid, "7", "IAM: No guest users in privileged roles", passed, f"userType={val}")
+
+        # PCI DSS Req 8: MFA enforced
+        val = user.get("mfaEnabled", False)
+        passed = bool(val)
+        record_check(results, uid, "8", "IAM: MFA enforced", passed, f"mfaEnabled={val}")
+
+def analyze_db(data, results):
+    for db in data.get("databases", []):
+        rid = db.get("id")
+
+        # PCI DSS Req 3 & 4: Transparent Data Encryption enabled
+        val = db.get("encryptionProtector")
+        passed = bool(val)
+        record_check(results, rid, "3,4", "DB: Transparent Data Encryption enabled", passed,
+                     f"encryptionProtector_present={bool(val)}")
+
+        # PCI DSS Req 7: Proper access containment
+        val = db.get("containmentState")
+        passed = bool(val)
+        record_check(results, rid, "7", "DB: Proper access containment", passed,
+                     f"containmentState={val}")
+
+        # PCI DSS Req 10: Auditing/logging enabled
+        val = db.get("auditSettings")
+        passed = bool(val)
+        record_check(results, rid, "10", "DB: Auditing/logging enabled", passed,
+                     f"auditSettings_present={bool(val)}")
+
+def main():
+    try:
+        with open("output/azure.json", "r") as f:
+            resources = json.load(f)
+    except FileNotFoundError:
+        print("No PCI DSS data file found (azure.json). Did you run the collector script?")
+        return
+
+    results = []
+
+    for item in resources:
+        if "account" in item and "blobService" in item:
+            analyze_storage(item, results)
+            continue
+
+        itype = item.get("type")
+        if itype == "storage":
+            analyze_storage(item, results)
+        elif itype == "vm":
+            analyze_vms(item, results)
+        elif itype == "iam":
+            analyze_iam(item, results)
+        elif itype == "db":
+            analyze_db(item, results)
+
+    # Save JSON with PASS + FAIL checks
+    with open("drift_report.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"PCI DSS analysis complete. Report saved to drift_report.json with {len(results)} total checks.")
+
+if __name__ == "__main__":
+    main()

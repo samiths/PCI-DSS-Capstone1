@@ -1,13 +1,6 @@
 pipeline {
     agent any
     stages {
-        stage('Checkout Code') {
-            steps {
-                // Clones the repository containing these scripts
-                checkout scm
-            }
-        }
-
         stage('Query Azure Infra State') {
             steps {
                 script {
@@ -75,3 +68,4 @@ pipeline {
     }
   }
 }
+
